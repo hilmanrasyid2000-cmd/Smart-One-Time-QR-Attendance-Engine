@@ -5,6 +5,7 @@ import UserPortal from './components/UserPortal';
 import ProjectorView from './components/ProjectorView';
 import { socket } from './utils/socket';
 import { sounds } from './utils/sound';
+import { clientEngine } from './utils/clientEngine';
 
 export default function App() {
   // Check if opened via QR scan link (e.g. ?token=JAMAL-XXXX)
@@ -18,63 +19,76 @@ export default function App() {
   const [visitors, setVisitors] = useState([]);
   const [roster, setRoster] = useState([]);
   const [guests, setGuests] = useState([]);
-  const [networkInfo, setNetworkInfo] = useState(null);
+  const [networkInfo, setNetworkInfo] = useState({ primaryIp: window.location.hostname });
   const [notification, setNotification] = useState(null);
 
-  // Fetch initial data & network IPs
+  // Fallback to local client engine
+  const loadFromClientEngine = () => {
+    const s = clientEngine.getSession();
+    const q = clientEngine.getCurrentQR();
+    const r = clientEngine.getRoster();
+    const a = clientEngine.getAttendance();
+    const v = clientEngine.getVisitors();
+
+    setSession(s);
+    setQrData(q);
+    setAttendance(a);
+    setVisitors(v);
+
+    const attendedSet = new Set(a.map((item) => item.name.toLowerCase()));
+    const rosterWithStatus = r.map((p) => ({
+      ...p,
+      attended: attendedSet.has(p.name.toLowerCase()),
+      attendanceRecord: a.find((item) => item.name.toLowerCase() === p.name.toLowerCase()) || null,
+    }));
+    setRoster(rosterWithStatus);
+  };
+
+  // Fetch data with automatic fallback for GitHub Pages
   const fetchData = async () => {
     try {
-      const [sessionRes, rosterRes, netRes] = await Promise.all([
-        fetch('/api/session'),
-        fetch('/api/roster'),
-        fetch('/api/network-info'),
-      ]);
-
+      const sessionRes = await fetch('/api/session');
       if (sessionRes.ok) {
         const data = await sessionRes.json();
         setSession(data.session);
         setQrData(data.qr);
-      }
 
-      if (rosterRes.ok) {
-        const data = await rosterRes.json();
-        setRoster(data.roster || []);
-        setGuests(data.guests || []);
-      }
+        const [rosterRes, netRes, attRes, visRes] = await Promise.all([
+          fetch('/api/roster'),
+          fetch('/api/network-info'),
+          fetch('/api/attendance'),
+          fetch('/api/visitors'),
+        ]);
 
-      if (netRes.ok) {
-        const data = await netRes.json();
-        setNetworkInfo(data);
-      }
-
-      // Also get initial attendance and visitors
-      const [attRes, visRes] = await Promise.all([
-        fetch('/api/attendance'),
-        fetch('/api/visitors'),
-      ]);
-
-      if (attRes.ok) {
-        const data = await attRes.json();
-        setAttendance(data.attendance || []);
-      }
-
-      if (visRes.ok) {
-        const data = await visRes.json();
-        setVisitors(data.visitors || []);
+        if (rosterRes.ok) {
+          const rData = await rosterRes.json();
+          setRoster(rData.roster || []);
+          setGuests(rData.guests || []);
+        }
+        if (netRes.ok) {
+          const nData = await netRes.json();
+          setNetworkInfo(nData);
+        }
+        if (attRes.ok) {
+          const aData = await attRes.json();
+          setAttendance(aData.attendance || []);
+        }
+        if (visRes.ok) {
+          const vData = await visRes.json();
+          setVisitors(vData.visitors || []);
+        }
+        return;
       }
     } catch (err) {
-      console.error('Error fetching initial data:', err);
+      // Backend not running (e.g. GitHub Pages) -> Use client engine
     }
+    loadFromClientEngine();
   };
 
   useEffect(() => {
     fetchData();
 
-    // Setup Socket.IO Event Listeners
-    socket.on('connect', () => {
-      console.log('Connected to attendance server');
-    });
-
+    // 1. Socket.IO Listeners (When running with Node server)
     socket.on('init_state', (data) => {
       if (data.session) setSession(data.session);
       if (data.qr) setQrData(data.qr);
@@ -82,35 +96,22 @@ export default function App() {
       if (data.visitors) setVisitors(data.visitors);
     });
 
-    // Dynamic QR rotation event
     socket.on('qr_rotated', (data) => {
       setQrData(data);
     });
 
-    // Real-Time Verified Attendance Event! (Triggers sound & toast)
     socket.on('attendance_new', ({ record }) => {
       setAttendance((prev) => [record, ...prev.filter((a) => a.id !== record.id)]);
       sounds.playSuccess();
-
-      // Show notification toast
       setNotification({
         type: 'attendance',
         title: 'Presensi Baru Terverifikasi!',
         message: `${record.name} telah berhasil absen (✓ Centang Hijau)`,
       });
       setTimeout(() => setNotification(null), 5000);
-
-      // Refresh roster status
-      fetch('/api/roster')
-        .then((res) => res.json())
-        .then((data) => {
-          setRoster(data.roster || []);
-          setGuests(data.guests || []);
-        })
-        .catch((e) => console.error(e));
+      fetchData();
     });
 
-    // Real-Time Visitor Entry Event! (When user inputs name on site)
     socket.on('visitor_new', (visitor) => {
       setVisitors((prev) => [visitor, ...prev]);
       sounds.playVisitorPop();
@@ -118,22 +119,44 @@ export default function App() {
 
     socket.on('session_updated', (data) => {
       setSession(data.session);
-      setAttendance([]);
-      setVisitors([]);
       fetchData();
     });
 
     socket.on('roster_updated', () => {
-      fetch('/api/roster')
-        .then((res) => res.json())
-        .then((data) => {
-          setRoster(data.roster || []);
-          setGuests(data.guests || []);
-        });
+      fetchData();
+    });
+
+    // 2. ClientEngine Listeners (When running standalone on GitHub Pages)
+    clientEngine.on('qr_rotated', (data) => {
+      setQrData(data);
+    });
+
+    clientEngine.on('attendance_new', ({ record }) => {
+      setAttendance((prev) => [record, ...prev.filter((a) => a.id !== record.id)]);
+      sounds.playSuccess();
+      setNotification({
+        type: 'attendance',
+        title: 'Presensi Baru Terverifikasi!',
+        message: `${record.name} telah berhasil absen (✓ Centang Hijau)`,
+      });
+      setTimeout(() => setNotification(null), 5000);
+      loadFromClientEngine();
+    });
+
+    clientEngine.on('visitor_new', (visitor) => {
+      setVisitors((prev) => [visitor, ...prev]);
+      sounds.playVisitorPop();
+    });
+
+    clientEngine.on('session_updated', () => {
+      loadFromClientEngine();
+    });
+
+    clientEngine.on('roster_updated', () => {
+      loadFromClientEngine();
     });
 
     return () => {
-      socket.off('connect');
       socket.off('init_state');
       socket.off('qr_rotated');
       socket.off('attendance_new');
@@ -151,15 +174,13 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(formData),
       });
-      const data = await res.json();
-      if (data.success) {
-        setSession(data.session);
-        setAttendance([]);
-        setVisitors([]);
+      if (res.ok) {
+        fetchData();
+        return;
       }
-    } catch (e) {
-      console.error('Reset session error:', e);
-    }
+    } catch (e) {}
+    clientEngine.resetSession(formData);
+    loadFromClientEngine();
   };
 
   const handleAddMember = async (memberData) => {
@@ -169,13 +190,13 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(memberData),
       });
-      const data = await res.json();
-      if (data.success) {
+      if (res.ok) {
         fetchData();
+        return;
       }
-    } catch (e) {
-      console.error('Add member error:', e);
-    }
+    } catch (e) {}
+    clientEngine.addRoster(memberData);
+    loadFromClientEngine();
   };
 
   const handleDeleteMember = async (id) => {
@@ -185,10 +206,11 @@ export default function App() {
       });
       if (res.ok) {
         fetchData();
+        return;
       }
-    } catch (e) {
-      console.error('Delete member error:', e);
-    }
+    } catch (e) {}
+    clientEngine.deleteRoster(id);
+    loadFromClientEngine();
   };
 
   return (

@@ -16,6 +16,7 @@ import QRScanner from './QRScanner';
 import AttendanceBadge from './AttendanceBadge';
 import { getDeviceFingerprint } from '../utils/fingerprint';
 import { sounds } from '../utils/sound';
+import { clientEngine } from '../utils/clientEngine';
 
 export default function UserPortal({ session, initialToken }) {
   const [step, setStep] = useState(1); // 1: Input Nama, 2: Scan QR, 3: Success Badge
@@ -74,23 +75,42 @@ export default function UserPortal({ session, initialToken }) {
         }),
       });
 
-      const data = await res.json();
-
-      if (!res.ok || !data.success) {
-        sounds.playError();
-        setErrorMessage(data.message || 'Gagal memverifikasi absensi.');
-        setIsLoading(false);
-        return;
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          sounds.playSuccess();
+          setAttendanceResult(data.record);
+          setStep(3);
+          return;
+        } else {
+          sounds.playError();
+          setErrorMessage(data.message || 'Gagal memverifikasi absensi.');
+          setIsLoading(false);
+          return;
+        }
       }
-
-      // Success!
-      sounds.playSuccess();
-      setAttendanceResult(data.record);
-      setStep(3);
     } catch (err) {
+      // Backend not running (e.g. GitHub Pages) -> Fallback to client engine
+    }
+
+    // Execute via local client engine
+    const result = clientEngine.checkIn({
+      token: tokenToUse,
+      name: nameToUse.trim(),
+      identifier: idToUse.trim(),
+      deviceFingerprint: fp,
+      deviceInfo: devInfo,
+      scanMethod: method,
+    });
+
+    if (!result.success) {
       sounds.playError();
-      setErrorMessage('Terjadi kendala jaringan saat menghubungi server. Pastikan HP terhubung ke WiFi.');
-    } finally {
+      setErrorMessage(result.message);
+      setIsLoading(false);
+    } else {
+      sounds.playSuccess();
+      setAttendanceResult(result.record);
+      setStep(3);
       setIsLoading(false);
     }
   };
@@ -112,7 +132,7 @@ export default function UserPortal({ session, initialToken }) {
 
     try {
       // Log visitor entry
-      await fetch('/api/visitor/entry', {
+      const res = await fetch('/api/visitor/entry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -122,8 +142,14 @@ export default function UserPortal({ session, initialToken }) {
           deviceInfo: deviceMeta?.deviceInfo || 'Mobile Web',
         }),
       });
+      if (!res.ok) throw new Error('API unavailable');
     } catch (err) {
-      console.warn('Visitor entry log notice:', err);
+      clientEngine.logVisitor({
+        name: name.trim(),
+        identifier: identifier.trim(),
+        deviceFingerprint: deviceMeta?.fingerprint || 'FP-UNKNOWN',
+        deviceInfo: deviceMeta?.deviceInfo || 'Mobile Web',
+      });
     }
 
     // IF token was already provided via URL scan from phone camera -> Check in immediately!
